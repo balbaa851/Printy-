@@ -43,4 +43,22 @@ t('pixels: saturation -100 is grey', () => { const d = new Uint8ClampedArray([20
 t('pixels: grayscale filter', () => { const d = new Uint8ClampedArray([200, 50, 20, 255]); adjustPixels(d, 1, 1, DEFAULT_PARAMS, 'grayscale', 100); assert.ok(Math.abs(d[0] - d[1]) <= 1 && Math.abs(d[1] - d[2]) <= 1); });
 t('pixels: toHex', () => assert.equal(toHex(255, 0, 128), '#FF0080'));
 t('pixels: dominant colour', () => { const d = new Uint8ClampedArray(400); for (let i = 0; i < 100; i++) d.set([255, 0, 0, 255], i * 4); assert.equal(dominantColors(d, 3)[0].hex, '#FF0000'); });
+
+// ---- performance helpers
+const { sharpen } = await import('../js/pixels.js');
+const { makeGovernor, sliceJob, PERF } = await import('../js/perf.js');
+t('pixels: LUT fast path equals per-pixel maths', () => {
+  const d = new Uint8ClampedArray(4 * 256); for (let i = 0; i < 256; i++) d.set([i, 255 - i, (i * 7) & 255, 255], i * 4);
+  const p = { ...DEFAULT_PARAMS, brightness: 17, contrast: 33, exposure: -20, warmth: 25 }, out = new Uint8ClampedArray(d.length); adjustPixels(out, 256, 1, p, 'none', 100, d);
+  const br = 17 * 2.55, ex = Math.pow(2, -20 / 50), C = 33 * 2.55, cf = (259 * (C + 255)) / (255 * (259 - C)), wm = 25 * 0.6;
+  for (let i = 0; i < 256; i++) { const f = (v, k) => (((v * ex + br) - 128) * cf + 128) + k; const e = new Uint8ClampedArray([f(d[i * 4], wm), f(d[i * 4 + 1], wm * .1), f(d[i * 4 + 2], -wm)]); assert.deepEqual([out[i * 4], out[i * 4 + 1], out[i * 4 + 2], out[i * 4 + 3]], [e[0], e[1], e[2], 255]); }
+});
+t('pixels: separate source buffer is left untouched', () => { const src = new Uint8ClampedArray([10, 20, 30, 255, 40, 50, 60, 255]), keep = new Uint8ClampedArray(src), dst = new Uint8ClampedArray(8); adjustPixels(dst, 2, 1, { ...DEFAULT_PARAMS, brightness: 40 }, 'sepia', 80, src); assert.deepEqual(src, keep); assert.notDeepEqual(dst, keep); });
+t('pixels: no-op copies source', () => { const src = new Uint8ClampedArray([1, 2, 3, 4]), dst = new Uint8ClampedArray(4); adjustPixels(dst, 1, 1, DEFAULT_PARAMS, 'none', 100, src); assert.deepEqual(dst, src); });
+t('governor: slow device lowers interactive resolution, fast device keeps full', () => {
+  const slow = makeGovernor(); for (let i = 0; i < 12; i++) slow.record(80 * slow.q * slow.q, slow.q); assert.ok(slow.q < 0.5, 'slow q=' + slow.q);
+  const fast = makeGovernor(); for (let i = 0; i < 40; i++) fast.record(1 * fast.q * fast.q, fast.q); assert.ok(fast.q >= 0.95, 'fast q=' + fast.q);
+});
+t('perf: tier table sane', () => assert.ok(['low', 'mid', 'high'].includes(PERF.tier) && PERF.prevDim >= 900 && PERF.dabs > 0));
+await new Promise((res) => { let k = 0; function* g() { for (let i = 0; i < 5; i++) { k++; yield; } } const j = sliceJob(g(), 1); j.flush(); t('sliceJob: flush runs the job to completion synchronously', () => { assert.equal(k, 5); assert.ok(j.finished); }); res(); });
 console.log('\n' + n + ' tests passed');

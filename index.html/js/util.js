@@ -238,3 +238,18 @@ export async function copyText(text) {
   }
   toast(L('Copied: ', 'تم النسخ: ') + text, 'success');
 }
+
+// ---------- Web fonts (lazy, non-blocking) ----------
+// The old page loaded ten font families in a render-blocking stylesheet. Now the UI fonts load after first paint and the
+// design fonts (used by text tools / templates) load only when an editor or template page opens.
+const FONT_Q = {
+  ui: 'family=Inter:wght@400;500;600;700&family=Cairo:wght@400;600;700',
+  design: 'family=Poppins:wght@400;700&family=Playfair+Display:wght@400;700&family=Montserrat:wght@400;700&family=Lobster&family=Tajawal:wght@400;700&family=Amiri:wght@400;700&family=Reem+Kufi:wght@400;700&family=Roboto+Mono:wght@400;700'
+};
+const fontDone = {};
+export function loadFonts(group = 'ui') {
+  if (fontDone[group]) return;
+  fontDone[group] = true;
+  const go = () => document.head.append(h('link', { rel: 'stylesheet', href: 'https://fonts.googleapis.com/css2?' + FONT_Q[group] + '&display=swap' }));
+  group === 'ui' && 'requestIdleCallback' in window ? requestIdleCallback(go, { timeout: 2500 }) : go();
+}

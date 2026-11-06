@@ -1,5 +1,6 @@
 import { L, isAr } from '../core.js';
 import { h, icon, refreshIcons } from '../util.js';
+import { PERF } from '../perf.js';
 import { TEMPLATES, CATEGORIES, drawTemplate, tplTitle, elFont } from '../templates-data.js';
 
 // Lazily draws previews when cards scroll into view.
@@ -9,7 +10,7 @@ export function observePreviews(scope) {
     const t = TEMPLATES.find(x => x.id === cv.dataset.tpl); if (!t) return;
     const fams = new Set(t.els.filter(e => e.t === 'text').map(e => elFont(e, ar)));
     await Promise.all([...fams].map(f => document.fonts.load('16px "' + f + '"').catch(() => 0)));
-    drawTemplate(cv, t, ar, 360); cv.classList.add('ready');
+    drawTemplate(cv, t, ar, PERF.tplDim); cv.classList.add('ready');
   };
   if (!('IntersectionObserver' in window)) { scope.querySelectorAll('canvas[data-tpl]').forEach(draw); return () => {}; }
   const io = new IntersectionObserver((es) => es.forEach(e => { if (e.isIntersecting) { io.unobserve(e.target); draw(e.target); } }), { rootMargin: '200px' });
@@ -18,7 +19,7 @@ export function observePreviews(scope) {
 }
 export function templateCard(t) {
   const cv = h('canvas', { 'data-tpl': t.id, class: 'tpl-canvas', role: 'img', 'aria-label': tplTitle(t, isAr()) });
-  cv.width = 360; cv.height = Math.round(360 * t.h / t.w);
+  cv.width = PERF.tplDim; cv.height = Math.round(PERF.tplDim * t.h / t.w);
   const cat = CATEGORIES.find(c => c[0] === t.cat);
   return h('a', { class: 'card tpl', href: '#/studio?tpl=' + t.id }, h('div', { class: 'tpl-thumb' }, cv), h('strong', null, tplTitle(t, isAr())),
     h('span', { class: 'muted small' }, (isAr() ? cat[2] : cat[1]) + ' · ' + t.w + ' × ' + t.h));

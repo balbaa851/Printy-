@@ -13,6 +13,16 @@ A browser-based design studio, photo editor, manual background editor, print cen
 | **Image Tools** | Batch compress / resize / convert (PNG, JPG, WebP), format info, dominant colours with HEX/RGB copy, ZIP download |
 | **Projects & Settings** | IndexedDB projects (localStorage fallback), rename/duplicate/delete, recover earlier versions, Arabic/English (RTL/LTR), light/dark, autosave options, clear data |
 
+## Performance on low-end devices
+
+`js/perf.js` rates the device (`<html data-perf="low|mid|high">`, overridable in **Settings → Performance**) and the editors adapt:
+
+* **Photo Editor** – tone/filter/effect results are cached; slider drags render at an adaptive lower resolution (a governor keeps each frame inside a few ms) and refine to full preview quality when you pause. Pixel maths uses look-up tables and reusable buffers (no per-frame allocation). Brush strokes paint into the small preview first and are applied to the full-resolution photo in the background; undo/redo of strokes stores only the touched rectangle.
+* **Design Studio** – canvas pixel ratio capped per tier, snap targets cached per drag, history snapshots intern image data and keep the paint layer as a canvas/Blob instead of re-encoding PNGs, autosave waits for idle time, paint tools recomposite only the dirty rectangle.
+* **Everywhere** – the ribbon no longer rebuilds on every DOM change, web fonts load lazily, low tier drops blur/shadows/transitions, template previews are smaller.
+
+Working-size limits per tier are in `TIERS` (js/perf.js). Benchmarks were taken with 6× CPU throttling: slider drag ≈155 → 20 ms/frame, brush ≈180 → 18 ms/frame.
+
 ## Run locally
 
 ```bash

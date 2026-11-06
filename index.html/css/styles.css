@@ -195,3 +195,21 @@ body.fullscreen main{flex:none;height:calc(100dvh - var(--hdr));overflow:hidden;
 .rb-ico .glyph{width:26px;height:26px;border-radius:7px;border:1.5px solid currentColor;display:grid;place-items:center;font-size:.8rem}
 .rb-sep{flex:none;width:1px;background:var(--line);margin:4px 6px}
 .rb-hide{display:none!important}
+
+/* ---- performance tiers (set on <html data-perf="low|mid|high"> by js/perf.js) ------------------------------------------
+   Low-end devices: no blur/backdrop effects, no big soft shadows, no transitions, no decorative backgrounds. Large canvases
+   are promoted to their own compositor layer so scrolling/zooming never repaints the page behind them. */
+.pe-canvas,.pr-canvas,.cv-holder canvas{backface-visibility:hidden}
+.pe-stage,.cv-stage,.rb-stage,.pr-stage{overscroll-behavior:contain}
+.tpls>.card,.cards>.card{content-visibility:auto;contain-intrinsic-size:auto 260px}
+:root[data-perf=low] body{transition:none}
+:root[data-perf=low] .header{backdrop-filter:none;background:var(--surface)}
+:root[data-perf=low] .cv-holder,:root[data-perf=low] .pe-inner,:root[data-perf=low] .pr-canvas,:root[data-perf=low] .tpl-canvas{box-shadow:none;outline:1px solid var(--line)}
+:root[data-perf=low] .card,:root[data-perf=low] .modal,:root[data-perf=low] .menu,:root[data-perf=low] .toast,:root[data-perf=low] .st-panel{box-shadow:none}
+:root[data-perf=low] .cv-stage{background:var(--surface-2)}
+:root[data-perf=low] .btn,:root[data-perf=low] .card,:root[data-perf=low] .tab,:root[data-perf=low] .drop-empty,:root[data-perf=low] .st-panel{transition:none}
+:root[data-perf=low] a.card:hover,:root[data-perf=low] button.card:hover{transform:none;box-shadow:none}
+:root[data-perf=low] .modal-back,:root[data-perf=low] .toast{animation:none}
+:root[data-perf=low] .crop-box{box-shadow:none;outline:9999px solid rgba(0,0,0,.5);outline-offset:0;clip-path:none}
+:root[data-perf=mid] .header{backdrop-filter:none}
+:root[data-perf=mid] .cv-holder,:root[data-perf=mid] .pe-inner,:root[data-perf=mid] .pr-canvas{box-shadow:0 2px 8px rgba(0,0,0,.2)}

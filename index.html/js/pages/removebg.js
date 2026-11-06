@@ -1,14 +1,15 @@
 import { L } from '../core.js';
+import { PERF } from '../perf.js';
 import { h, icon, refreshIcons, toast, confirmDialog, validateImage, fileToCanvas, canvasToBlob, downloadBlob, baseName, clamp } from '../util.js';
 
 // Manual background editing (colour tolerance + eraser/restore brush). Not automatic AI removal.
 const S = { orig: null, cur: null, name: '', hist: [], hi: -1, tool: 'pick', tol: 40, feather: 10, contiguous: true, size: 30, zoom: 1 };
-const MAX_DIM = 3000;
 
 export function removeColor(data, w, h_, sx, sy, tol, feather, contiguous) {
   const i0 = (sy * w + sx) * 4, r0 = data[i0], g0 = data[i0 + 1], b0 = data[i0 + 2];
-  const lim = tol + feather, dist = (i) => Math.hypot(data[i] - r0, data[i + 1] - g0, data[i + 2] - b0);
-  const apply = (i) => { const d = dist(i); if (d > lim) return false; const a = d <= tol || feather === 0 ? 0 : Math.round(255 * (d - tol) / feather); if (a < data[i + 3]) data[i + 3] = a; return true; };
+  // squared distances: no sqrt/hypot per pixel except inside the soft-edge band
+  const lim = tol + feather, lim2 = lim * lim, tol2 = tol * tol;
+  const apply = (i) => { const dr = data[i] - r0, dg = data[i + 1] - g0, db = data[i + 2] - b0, d2 = dr * dr + dg * dg + db * db; if (d2 > lim2) return false; const a = d2 <= tol2 || feather === 0 ? 0 : Math.round(255 * (Math.sqrt(d2) - tol) / feather); if (a < data[i + 3]) data[i + 3] = a; return true; };
   if (!contiguous) { for (let i = 0; i < data.length; i += 4) apply(i); return; }
   const seen = new Uint8Array(w * h_), stack = [sy * w + sx]; seen[sy * w + sx] = 1;
   while (stack.length) {
@@ -22,7 +23,7 @@ export function removeColor(data, w, h_, sx, sy, tol, feather, contiguous) {
 }
 
 export async function mount(root) {
-  let painting = false, last = null, disposed = false;
+  let painting = false, last = null, disposed = false, pend = null, raf = 0;
   const stage = h('div', { class: 'rb-stage checker' });
   const panel = h('aside', { class: 'st-panel' });
   const body = h('div', { class: 'panel-body' });
@@ -46,14 +47,14 @@ export async function mount(root) {
     if (S.cur && S.hist.length > 1 && !(await confirmDialog({ title: L('Open a new photo?', 'فتح صورة جديدة؟'), message: L('Your current edits will be discarded.', 'سيتم تجاهل تعديلاتك الحالية.'), confirmText: L('Open', 'فتح'), danger: true }))) return;
     const v = await validateImage(f); if (!v.ok) return toast(v.error, 'error');
     try {
-      const c = await fileToCanvas(f, MAX_DIM);
+      const MAX_DIM = PERF.rbDim, c = await fileToCanvas(f, MAX_DIM);
       if (c.srcWidth > MAX_DIM || c.srcHeight > MAX_DIM) toast(L('Photo reduced to ' + MAX_DIM + ' px on its longest side so editing stays smooth.', 'تم تصغير الصورة إلى ' + MAX_DIM + ' بكسل للضلع الأطول ليبقى التحرير سلساً.'));
       S.orig = c; S.cur = document.createElement('canvas'); S.cur.width = c.width; S.cur.height = c.height; S.cur.getContext('2d', { willReadFrequently: true }).drawImage(c, 0, 0);
       S.name = baseName(f.name); S.hist = []; S.hi = -1; S.zoom = 1; push(); build();
     } catch (e) { toast(e.message, 'error'); }
   }
   const ctx = () => S.cur.getContext('2d', { willReadFrequently: true });
-  function push() { S.hist = S.hist.slice(0, S.hi + 1); S.hist.push(ctx().getImageData(0, 0, S.cur.width, S.cur.height)); if (S.hist.length > 15) S.hist.shift(); S.hi = S.hist.length - 1; sync(); }
+  function push() { S.hist = S.hist.slice(0, S.hi + 1); S.hist.push(ctx().getImageData(0, 0, S.cur.width, S.cur.height)); while (S.hist.length > 2 && (S.hist.length > 15 || S.hist.length * S.cur.width * S.cur.height * 4 > PERF.histMB * 1048576 * 0.5)) S.hist.shift(); S.hi = S.hist.length - 1; sync(); }
   function go(i) { if (i < 0 || i >= S.hist.length) return; S.hi = i; ctx().putImageData(S.hist[i], 0, 0); sync(); }
   function sync() { undoB.disabled = S.hi <= 0; redoB.disabled = S.hi >= S.hist.length - 1; }
   function setZoom(z) { S.zoom = clamp(z, 0.25, 6); layout(); }
@@ -63,7 +64,7 @@ export async function mount(root) {
   function dot(p, rad) {
     const c = ctx(); c.save(); c.beginPath(); c.arc(p.x, p.y, rad, 0, Math.PI * 2);
     if (S.tool === 'erase') { c.globalCompositeOperation = 'destination-out'; c.fill(); }
-    else { c.clip(); c.globalCompositeOperation = 'source-over'; c.clearRect(p.x - rad, p.y - rad, rad * 2, rad * 2); c.drawImage(S.orig, 0, 0); }
+    else { c.clip(); c.globalCompositeOperation = 'source-over'; const x0 = Math.floor(p.x - rad), y0 = Math.floor(p.y - rad), q = Math.ceil(rad * 2) + 2; c.clearRect(x0, y0, q, q); c.drawImage(S.orig, x0, y0, q, q, x0, y0, q, q); }
     c.restore();
   }
   function stroke(p) {
@@ -77,8 +78,9 @@ export async function mount(root) {
       const id = ctx().getImageData(0, 0, S.cur.width, S.cur.height); removeColor(id.data, id.width, id.height, x, y, S.tol, S.feather, S.contiguous); ctx().putImageData(id, 0, 0); push();
     } else { painting = true; last = null; S.cur.setPointerCapture(e.pointerId); stroke(p); }
   }
-  const onMove = (e) => { if (painting) stroke(pos(e)); };
-  const onUp = () => { if (painting) { painting = false; last = null; push(); } };
+  // pointer events (up to 240 Hz) only record the newest position; strokes are drawn once per animation frame
+  const onMove = (e) => { if (!painting) return; pend = pos(e); if (!raf) raf = requestAnimationFrame(() => { raf = 0; if (pend && painting) { stroke(pend); } pend = null; }); };
+  const onUp = () => { if (painting) { if (pend) { stroke(pend); pend = null; } painting = false; last = null; push(); } };
 
   function panelView() {
     const seg = (k, ic, en, ar) => h('button', { class: 'btn sm' + (S.tool === k ? ' on' : ''), 'aria-pressed': S.tool === k, onclick: () => { S.tool = k; S.cur && (S.cur.style.cursor = k === 'pick' ? 'crosshair' : 'cell'); panelRender(); } }, icon(ic), L(en, ar));
@@ -112,5 +114,5 @@ export async function mount(root) {
   }
   const ro = new ResizeObserver(() => { if (!disposed) layout(); }); ro.observe(stage);
   build();
-  return () => { disposed = true; ro.disconnect(); if (S.cur) { S.cur.onpointerdown = S.cur.onpointermove = S.cur.onpointerup = S.cur.onpointercancel = null; } };
+  return () => { disposed = true; cancelAnimationFrame(raf); ro.disconnect(); if (S.cur) { S.cur.onpointerdown = S.cur.onpointermove = S.cur.onpointerup = S.cur.onpointercancel = null; } };
 }

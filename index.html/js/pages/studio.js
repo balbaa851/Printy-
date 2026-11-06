@@ -1,7 +1,8 @@
 import { settings, guard, hooks, L, isAr } from '../core.js';
 import { h, icon, refreshIcons, toast, confirmDialog, promptDialog, modal, popMenu, loadLib, spinner, validateImage, fileToCanvas, canvasToBlob, downloadBlob, safeName, uid, debounce, clamp, $, $$ } from '../util.js';
 import * as db from '../db.js';
-import { createPaint } from './studio-paint.js';
+import { createPaint, PLACEHOLDER } from './studio-paint.js';
+import { PERF } from '../perf.js';
 import { makePdf } from '../pdf.js';
 import { getTemplate, TEMPLATES, elText, elFont, tplTitle } from '../templates-data.js';
 
@@ -72,6 +73,7 @@ async function startEditor(root, project, init = {}) {
   root.replaceChildren(spinner());
   const fabric = await loadLib('fabric');
   const coarse = matchMedia('(pointer: coarse)').matches;
+  fabric.devicePixelRatio = PERF.dprCap; // cap the canvas pixel ratio: a 3× phone screen would otherwise paint 9× the pixels
   fabric.Object.prototype.set({ transparentCorners: false, cornerColor: '#ffffff', cornerStrokeColor: VIOLET, borderColor: VIOLET, cornerSize: coarse ? 20 : 11, cornerStyle: 'circle', padding: 2, borderScaleFactor: 1.5 });
 
   let W = project.w, H = project.h, zoom = 1, tab = 'props', gridOn = false, snapOn = true, dirty = false, saving = false, savePending = false, lastVersion = 0, disposed = false;
@@ -147,32 +149,64 @@ async function startEditor(root, project, init = {}) {
   zoomLbl.addEventListener('click', () => { zoomAuto = true; });
 
   // ---- history / saving
-  const snap = () => JSON.stringify({ w: W, h: H, data: canvas.toJSON(PROPS) });
-  function histBytes() { return hist.reduce((n, s) => n + s.length, 0); }
+  // Snapshots must be cheap: big image data-URLs are interned once (token in the JSON instead of megabytes of text), and the
+  // raster paint layer is kept as a canvas copy / compressed Blob instead of being PNG-encoded on every change.
+  const srcStore = new Map(), srcIdx = new Map(), paintStore = new Map(), compressing = new Set(); let srcSeq = 0, paintSeq = 0, cmpT = 0;
+  const internSrc = (src) => { let t = srcIdx.get(src); if (!t) { t = '@img' + (++srcSeq); srcIdx.set(src, t); srcStore.set(t, src); } return t; };
+  const walk = (objs, fn) => { if (objs) objs.forEach(o => { fn(o); if (o.objects) walk(o.objects, fn); }); };
+  const getPaint = () => canvas.getObjects().find(o => o.isPaint);
+  function stashPaint(l) {
+    if (l._stashTok && l._stashRev === l.pRev && paintStore.has(l._stashTok)) return l._stashTok;
+    const el = l.getElement(), c = document.createElement('canvas'); c.width = el.width; c.height = el.height; c.getContext('2d').drawImage(el, 0, 0);
+    const t = 'p' + (++paintSeq); paintStore.set(t, c); l._stashTok = t; l._stashRev = l.pRev;
+    clearTimeout(cmpT); cmpT = setTimeout(compressPaint, 1500); return t;
+  }
+  function compressPaint() { // older stashes become compressed Blobs in the background (encoding runs off the main thread)
+    [...paintStore.keys()].slice(0, -3).forEach(t => { const v = paintStore.get(t); if (v instanceof HTMLCanvasElement && !compressing.has(t)) { compressing.add(t); v.toBlob((b) => { compressing.delete(t); if (b && paintStore.has(t)) paintStore.set(t, b); }); } });
+  }
+  function snap() {
+    const l = getPaint(); if (l) l._snap = true; let data;
+    try { data = canvas.toJSON(PROPS); } finally { if (l) l._snap = false; }
+    let tok = null;
+    walk(data.objects, (o) => { if (o.type !== 'image' || typeof o.src !== 'string') return; if (o.isPaint && l) { tok = stashPaint(l); o.paintRef = tok; o.src = PLACEHOLDER; } else if (o.src.length > 512) o.src = internSrc(o.src); });
+    return { s: JSON.stringify({ w: W, h: H, data }), tok };
+  }
+  const expand = (data) => { walk(data.objects, (o) => { if (o.type === 'image' && typeof o.src === 'string' && o.src.startsWith('@img')) o.src = srcStore.get(o.src) || o.src; }); return data; };
+  async function restorePaint() {
+    const l = getPaint(); if (!l || !l.paintRef) return; const v = paintStore.get(l.paintRef); if (!v) return;
+    const c = document.createElement('canvas'), cx = c.getContext('2d');
+    if (v instanceof Blob) { const bm = await createImageBitmap(v); c.width = bm.width; c.height = bm.height; cx.drawImage(bm, 0, 0); if (bm.close) bm.close(); } else { c.width = v.width; c.height = v.height; cx.drawImage(v, 0, 0); }
+    l.setElement(c); paint.arm(l); l.pRev = (l.pRev || 0) + 1; l._stashTok = l.paintRef; l._stashRev = l.pRev; l.dirty = true; canvas.requestRenderAll();
+  }
+  function histBytes() { return hist.reduce((n, e) => n + e.s.length, 0); }
   function commit() {
     if (restoring || disposed) return;
-    const s = snap(); if (hist[hi] === s) return;
-    hist = hist.slice(0, hi + 1); hist.push(s);
-    while (hist.length > 80 || (histBytes() > 90e6 && hist.length > 2)) hist.shift();
+    const e = snap(); if (hist[hi] && hist[hi].s === e.s) return;
+    hist = hist.slice(0, hi + 1); hist.push(e);
+    while (hist.length > PERF.hist || (histBytes() > PERF.jsonMB * 1e6 && hist.length > 2)) hist.shift();
     hi = hist.length - 1; syncUndo(); markDirty();
+    const live = new Set(hist.map(x => x.tok)); for (const k of [...paintStore.keys()]) if (!live.has(k)) paintStore.delete(k);
   }
   function syncUndo() { undoBtn.disabled = hi <= 0; redoBtn.disabled = hi >= hist.length - 1; }
   async function goto(i) {
     if (i < 0 || i >= hist.length) return;
     restoring = true; hi = i;
-    const s = JSON.parse(hist[i]); W = s.w; H = s.h;
-    canvas.discardActiveObject(); await loadJSON(s.data); applyZoom();
+    const s = JSON.parse(hist[i].s); W = s.w; H = s.h;
+    canvas.discardActiveObject(); await loadJSON(expand(s.data)); await restorePaint(); applyZoom();
     restoring = false; syncUndo(); markDirty(); renderPanel(); refreshFonts();
   }
   const undo = () => goto(hi - 1), redo = () => goto(hi + 1);
-  const autosave = debounce(() => { if (settings.autosave) saveNow(false); }, Math.max(1, settings.autosaveSec) * 1000);
+  // Saving serialises the whole design, so it waits for an idle moment and never starts while a finger / mouse button is down.
+  let pointerDown = false;
+  const whenIdle = (fn) => ('requestIdleCallback' in window ? requestIdleCallback(fn, { timeout: 4000 }) : setTimeout(fn, 200));
+  const autosave = debounce(function tick() { if (!settings.autosave) return; if (pointerDown) return autosave(); whenIdle(() => saveNow(false)); }, Math.max(PERF.saveMin, settings.autosaveSec) * 1000);
   function setStatus(kind) {
     statusKind = kind;
     const t = { dirty: L('Unsaved changes', 'تغييرات غير محفوظة'), saving: L('Saving…', 'جارٍ الحفظ…'), saved: L('Saved ', 'تم الحفظ ') + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), error: L('Save failed', 'فشل الحفظ') };
     status.textContent = t[kind]; status.dataset.kind = kind;
   }
   function markDirty() { dirty = true; guard.dirty = true; setStatus('dirty'); autosave(); }
-  const thumb = () => { try { return canvas.toDataURL({ format: 'jpeg', quality: 0.6, multiplier: Math.min(1, 260 / (Math.max(W, H) * zoom)) }); } catch { return ''; } };
+  const thumb = () => { try { return canvas.toDataURL({ format: 'jpeg', quality: 0.6, multiplier: Math.min(1, (PERF.tier === 'low' ? 170 : 260) / (Math.max(W, H) * zoom)) }); } catch { return ''; } };
   async function saveNow(version = false, manual = false) {
     if (disposed && !dirty) return;
     if (saving) { savePending = true; return; }
@@ -233,7 +267,7 @@ async function startEditor(root, project, init = {}) {
       const v = await validateImage(f);
       if (!v.ok) { toast(v.error, 'error'); continue; }
       try {
-        const c = await fileToCanvas(f, 3000);
+        const c = await fileToCanvas(f, PERF.imgMax);
         const url = c.toDataURL(v.type === 'image/jpeg' ? 'image/jpeg' : 'image/png', 0.92);
         await new Promise((res) => fabric.Image.fromURL(url, (img) => {
           const k = Math.min(1, (W * 0.8) / img.width, (H * 0.8) / img.height); img.scale(k); img.set({ name: f.name.slice(0, 40) });
@@ -256,12 +290,18 @@ async function startEditor(root, project, init = {}) {
   const isText = (o) => ['textbox', 'text', 'i-text'].includes(o.type);
 
   // ---- snapping & guides
+  // Snap targets are collected once per drag (not on every mouse-move for every object on the canvas).
+  let snapCache = null;
   canvas.on('object:moving', (e) => {
     const o = e.target; guides = [];
     if (!snapOn) return;
     const T = 6 / zoom, br = o.getBoundingRect(true, true);
-    const xs = [0, W / 2, W], ys = [0, H / 2, H];
-    canvas.getObjects().forEach(x => { if (x !== o && x.visible && !(o._objects && o._objects.includes(x))) { const b = x.getBoundingRect(true, true); xs.push(b.left, b.left + b.width / 2, b.left + b.width); ys.push(b.top, b.top + b.height / 2, b.top + b.height); } });
+    if (!snapCache || snapCache.o !== o) {
+      const xs = [0, W / 2, W], ys = [0, H / 2, H];
+      canvas.getObjects().forEach(x => { if (x !== o && x.visible && !(o._objects && o._objects.includes(x))) { const b = x.getBoundingRect(true, true); xs.push(b.left, b.left + b.width / 2, b.left + b.width); ys.push(b.top, b.top + b.height / 2, b.top + b.height); } });
+      snapCache = { o, xs, ys };
+    }
+    const { xs, ys } = snapCache;
     const mine = (a, s) => [a, a + s / 2, a + s];
     let bx = null, by = null;
     for (const m of mine(br.left, br.width)) for (const c of xs) { const d = c - m; if (Math.abs(d) < T && (!bx || Math.abs(d) < Math.abs(bx.d))) bx = { d, c }; }
@@ -269,22 +309,24 @@ async function startEditor(root, project, init = {}) {
     if (bx) { o.left += bx.d; guides.push({ x: bx.c }); } if (by) { o.top += by.d; guides.push({ y: by.c }); }
     o.setCoords();
   });
-  canvas.on('before:render', () => { try { canvas.clearContext(canvas.contextTop); } catch { /* ignore */ } });
+  let guidesDrawn = false; // the top layer only needs clearing when guide lines were drawn on it
+  canvas.on('before:render', () => { if (!guides.length && !guidesDrawn) return; guidesDrawn = false; try { canvas.clearContext(canvas.contextTop); } catch { /* ignore */ } });
   canvas.on('after:render', () => {
     if (!guides.length) return;
     const ctx = canvas.contextTop; if (!ctx) return;
-    ctx.save(); ctx.strokeStyle = '#ec4899'; ctx.lineWidth = 1; ctx.setLineDash([5, 4]);
+    guidesDrawn = true; ctx.save(); ctx.strokeStyle = '#ec4899'; ctx.lineWidth = 1; ctx.setLineDash([5, 4]);
     guides.forEach(g => { ctx.beginPath(); if (g.x != null) { ctx.moveTo(g.x * zoom, 0); ctx.lineTo(g.x * zoom, H * zoom); } else { ctx.moveTo(0, g.y * zoom); ctx.lineTo(W * zoom, g.y * zoom); } ctx.stroke(); });
     ctx.restore();
   });
   canvas.on('mouse:up', () => { if (guides.length) { guides = []; canvas.requestRenderAll(); } });
   canvas.on('object:modified', (e) => {
     if (gridOn && snapOn && e.target && e.action === 'drag') { e.target.set({ left: Math.round(e.target.left / 20) * 20, top: Math.round(e.target.top / 20) * 20 }); e.target.setCoords(); canvas.requestRenderAll(); }
-    commit(); renderPanel(); renderLayers();
+    commit(); renderPanel();
   });
   canvas.on('text:editing:exited', () => { commit(); renderLayers(); });
+  canvas.on('mouse:down', () => { pointerDown = true; snapCache = null; }); canvas.on('mouse:up', () => { pointerDown = false; snapCache = null; });
   canvas.on('selection:created', onSel); canvas.on('selection:updated', onSel); canvas.on('selection:cleared', onSel);
-  function onSel() { renderPanel(); renderLayers(); }
+  function onSel() { renderPanel(); }
 
   // ---- panel
   const panelBody = h('div', { class: 'panel-body' });

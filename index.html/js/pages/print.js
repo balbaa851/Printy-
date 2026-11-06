@@ -1,4 +1,5 @@
 import { L, isAr } from '../core.js';
+import { PERF } from '../perf.js';
 import { h, icon, refreshIcons, toast, loadLib, validateImage, fileToCanvas, canvasToBlob, downloadBlob, baseName, safeName, clamp, dropzone, spinner } from '../util.js';
 import * as db from '../db.js';
 import { makePdf } from '../pdf.js';
@@ -121,7 +122,7 @@ export async function mount(root, params) {
     const g = sheetGeometry(S);
     const avail = stageEl.clientWidth - 32, availH = stageEl.clientHeight - 32;
     const k = Math.max(0.1, Math.min(avail / g.total.w, availH / g.total.h, 3));
-    const ratio = Math.min(devicePixelRatio || 1, 2);
+    const ratio = Math.min(devicePixelRatio || 1, PERF.dprCap);
     preview.style.width = g.total.w * k + 'px'; preview.style.height = g.total.h * k + 'px';
     const W = Math.round(g.total.w * k * ratio), H = Math.round(g.total.h * k * ratio);
     preview.width = W; preview.height = H;

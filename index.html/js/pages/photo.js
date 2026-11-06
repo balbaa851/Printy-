@@ -1,16 +1,18 @@
 import { L, isAr } from '../core.js';
 import { h, icon, refreshIcons, toast, confirmDialog, modal, validateImage, fileToCanvas, canvasToBlob, downloadBlob, baseName, clamp, formatBytes } from '../util.js';
 import { adjustPixels, FILTERS, DEFAULT_PARAMS } from '../pixels.js';
+import { PERF, makeGovernor, sliceJob, calibrate } from '../perf.js';
 
 // Session state lives at module level so switching language or tabs does not lose the photo.
-const S = { base: null, orig: null, name: '', overlays: [], params: { ...DEFAULT_PARAMS }, filter: 'none', amt: 100, hist: [], hi: -1, sel: -1, ver: 0, tab: 'adjust', compare: false, fx: { blur: 0, vignette: 0, grain: 0, pixelate: 0, hue: 0, invert: 0, border: 0, bc: '#ffffff', shadows: 0, highlights: 0, tint: 0, fade: 0 }, zoom: 1, rt: { tool: 'blur', size: 30, strength: 50, src: null, setSrc: false }, dr: { tool: 'pen', color: '#ef4444', size: 8, opacity: 100 } };
+const S = { base: null, orig: null, rev: 0, name: '', overlays: [], params: { ...DEFAULT_PARAMS }, filter: 'none', amt: 100, hist: [], hi: -1, sel: -1, ver: 0, tab: 'adjust', compare: false, fx: { blur: 0, vignette: 0, grain: 0, pixelate: 0, hue: 0, invert: 0, border: 0, bc: '#ffffff', shadows: 0, highlights: 0, tint: 0, fade: 0 }, zoom: 1, rt: { tool: 'blur', size: 30, strength: 50, src: null, setSrc: false }, dr: { tool: 'pen', color: '#ef4444', size: 8, opacity: 100 } };
 const FXD = { blur: 0, vignette: 0, grain: 0, pixelate: 0, hue: 0, invert: 0, border: 0, bc: '#ffffff', shadows: 0, highlights: 0, tint: 0, fade: 0 };
 const FX = [['shadows', 'Shadows', 'الظلال', -100, 100], ['highlights', 'Highlights', 'الإضاءات العالية', -100, 100], ['tint', 'Tint (green–magenta)', 'الصبغة', -100, 100], ['fade', 'Fade', 'تلاشي', 0, 100], ['blur', 'Blur', 'ضبابية', 0, 40], ['pixelate', 'Pixelate', 'تبكسل', 0, 40], ['vignette', 'Vignette', 'تظليل الحواف', 0, 100], ['grain', 'Film grain', 'حبيبات الفيلم', 0, 100], ['hue', 'Hue shift', 'تدوير الألوان', -180, 180], ['invert', 'Invert', 'عكس الألوان', 0, 100], ['border', 'Border', 'إطار', 0, 40]];
 const SWATCHES = ['#ef4444', '#f97316', '#facc15', '#22c55e', '#06b6d4', '#3b82f6', '#a855f7', '#ec4899', '#ffffff', '#000000'];
 const FONTS = ['Inter', 'Poppins', 'Montserrat', 'Playfair Display', 'Lobster', 'Roboto Mono', 'Cairo', 'Tajawal', 'Amiri', 'Reem Kufi', 'Arial', 'Georgia'];
 const STICKERS = ['⭐', '❤️', '🔥', '😀', '😎', '🎉', '✨', '👍', '🌈', '📌', '💡', '🌸', '🏆', '☀️', '🎈', '💬'];
 const SHAPES = [['rect', 'square', 'Rectangle', 'مستطيل'], ['circle', 'circle', 'Circle', 'دائرة'], ['tri', 'triangle', 'Triangle', 'مثلث'], ['line', 'minus', 'Line', 'خط'], ['star', 'star', 'Star', 'نجمة'], ['arrow', '➜', 'Arrow', 'سهم'], ['heart', '♥', 'Heart', 'قلب']];
-const MAX_DIM = 6000, PREV_DIM = 1400;
+// Size limits come from the device tier (js/perf.js): weak devices get a smaller working size so editing stays at full frame rate.
+const owned = new WeakSet(); // canvases this editor created and may edit in place (never the pristine original)
 const FNAMES = { none: ['Original', 'الأصل'], grayscale: ['Grayscale', 'رمادي'], sepia: ['Sepia', 'بني قديم'], vintage: ['Vintage', 'عتيق'], vivid: ['Vivid', 'زاهٍ'], cool: ['Cool', 'بارد'], warm: ['Warm', 'دافئ'], cinematic: ['Cinematic', 'سينمائي'] };
 const ADJ = [['brightness', 'Brightness', 'السطوع'], ['contrast', 'Contrast', 'التباين'], ['saturation', 'Saturation', 'التشبع'], ['exposure', 'Exposure', 'التعريض'], ['warmth', 'Warmth', 'الدفء'], ['sharpness', 'Sharpness', 'الحدة']];
 
@@ -47,10 +49,14 @@ function drawOverlays(ctx, s, ui) {
     ctx.restore();
   });
 }
+let fxTmp = null; // one scratch canvas reused by every effect pass (no per-frame canvas allocation)
+const fxCanvas = (w, hh) => { const t = fxTmp || (fxTmp = document.createElement('canvas')); if (t.width !== w) t.width = w; if (t.height !== hh) t.height = hh; return t; };
+const fxActive = (f) => f.blur || f.hue || f.invert || f.pixelate || f.shadows || f.highlights || f.tint || f.fade || f.vignette || f.grain || f.border;
+const hasTone = () => { const p = S.params; return S.filter !== 'none' || p.brightness || p.contrast || p.saturation || p.exposure || p.warmth || p.sharpness > 0; };
 function applyFx(ctx, w, hh) {
-  const f = S.fx, u = Math.max(w, hh), mk = () => { const t = document.createElement('canvas'); t.width = w; t.height = hh; return t; };
-  if (f.pixelate > 0) { const b = Math.max(2, f.pixelate * u / 300), t = mk(), tc = t.getContext('2d'); t.width = Math.max(1, Math.round(w / b)); t.height = Math.max(1, Math.round(hh / b)); tc.drawImage(ctx.canvas, 0, 0, t.width, t.height); ctx.imageSmoothingEnabled = false; ctx.clearRect(0, 0, w, hh); ctx.drawImage(t, 0, 0, w, hh); ctx.imageSmoothingEnabled = true; }
-  if ((f.blur || f.hue || f.invert) && 'filter' in ctx) { const t = mk(); t.getContext('2d').drawImage(ctx.canvas, 0, 0); ctx.clearRect(0, 0, w, hh); ctx.filter = `blur(${f.blur * u / 1000}px) hue-rotate(${f.hue}deg) invert(${f.invert}%)`; ctx.drawImage(t, 0, 0); ctx.filter = 'none'; }
+  const f = S.fx; if (!fxActive(f)) return; const u = Math.max(w, hh);
+  if (f.pixelate > 0) { const b = Math.max(2, f.pixelate * u / 300), tw = Math.max(1, Math.round(w / b)), th = Math.max(1, Math.round(hh / b)), t = fxCanvas(tw, th), tc = t.getContext('2d'); tc.clearRect(0, 0, tw, th); tc.drawImage(ctx.canvas, 0, 0, tw, th); ctx.imageSmoothingEnabled = false; ctx.clearRect(0, 0, w, hh); ctx.drawImage(t, 0, 0, tw, th, 0, 0, w, hh); ctx.imageSmoothingEnabled = true; }
+  if ((f.blur || f.hue || f.invert) && 'filter' in ctx) { const t = fxCanvas(w, hh), tc = t.getContext('2d'); tc.clearRect(0, 0, w, hh); tc.drawImage(ctx.canvas, 0, 0); ctx.clearRect(0, 0, w, hh); ctx.filter = `blur(${f.blur * u / 1000}px) hue-rotate(${f.hue}deg) invert(${f.invert}%)`; ctx.drawImage(t, 0, 0, w, hh); ctx.filter = 'none'; }
   if (f.shadows || f.highlights || f.tint || f.fade) { const id = ctx.getImageData(0, 0, w, hh), d = id.data, fd = f.fade / 100; for (let i = 0; i < d.length; i += 4) { const l = (.3 * d[i] + .59 * d[i + 1] + .11 * d[i + 2]) / 255, a = f.shadows / 100 * (1 - l) * (1 - l) * 70 + f.highlights / 100 * l * l * 70, tn = f.tint * .3; d[i] = d[i] * (1 - fd * .25) + fd * 50 + a + tn; d[i + 1] = d[i + 1] * (1 - fd * .25) + fd * 50 + a - tn; d[i + 2] = d[i + 2] * (1 - fd * .25) + fd * 50 + a + tn; } ctx.putImageData(id, 0, 0); }
   if (f.vignette > 0) { const g = ctx.createRadialGradient(w / 2, hh / 2, Math.min(w, hh) * .25, w / 2, hh / 2, Math.hypot(w, hh) / 2); g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, `rgba(0,0,0,${f.vignette / 100 * .9})`); ctx.fillStyle = g; ctx.fillRect(0, 0, w, hh); }
   if (f.grain > 0) { const id = ctx.getImageData(0, 0, w, hh), d = id.data; let r = 12345; const a = f.grain * .8; for (let i = 0; i < d.length; i += 4) { r = (r * 1664525 + 1013904223) >>> 0; const n = ((r >>> 24) / 255 - .5) * a; d[i] += n; d[i + 1] += n; d[i + 2] += n; } ctx.putImageData(id, 0, 0); }
@@ -58,18 +64,94 @@ function applyFx(ctx, w, hh) {
 }
 function renderFull() {
   const c = document.createElement('canvas'); c.width = S.base.width; c.height = S.base.height;
-  const ctx = c.getContext('2d'); ctx.drawImage(S.base, 0, 0);
-  if (S.filter !== 'none' || Object.entries(S.params).some(([, v]) => v)) { const id = ctx.getImageData(0, 0, c.width, c.height); adjustPixels(id.data, c.width, c.height, S.params, S.filter, S.amt); ctx.putImageData(id, 0, 0); }
+  const ctx = c.getContext('2d', { willReadFrequently: true }); ctx.drawImage(S.base, 0, 0);
+  if (hasTone()) { const id = ctx.getImageData(0, 0, c.width, c.height); adjustPixels(id.data, c.width, c.height, S.params, S.filter, S.amt); ctx.putImageData(id, 0, 0); }
   applyFx(ctx, c.width, c.height);
   drawOverlays(ctx, 1, false);
+  if (fxTmp) { fxTmp.width = fxTmp.height = 0; fxTmp = null; } // release the large scratch buffer after an export
   return c;
 }
 const clone = (o) => JSON.parse(JSON.stringify(o));
 const snapshot = () => ({ base: S.base, overlays: clone(S.overlays), params: { ...S.params }, filter: S.filter, amt: S.amt, fx: { ...S.fx } });
-function pushHist() { S.hist = S.hist.slice(0, S.hi + 1); S.hist.push(snapshot()); if (S.hist.length > 30) S.hist.shift(); S.hi = S.hist.length - 1; }
+const copyCanvas = (c) => { const n = document.createElement('canvas'); n.width = c.width; n.height = c.height; n.getContext('2d').drawImage(c, 0, 0); return n; };
+const cutCanvas = (c, x, y, w, h) => { const n = document.createElement('canvas'); n.width = w; n.height = h; n.getContext('2d').drawImage(c, x, y, w, h, 0, 0, w, h); return n; };
+// History entries share pixel canvases. Retouch strokes are stored as small before/after *patches* of the touched rectangle
+// (entry.patch) instead of a full-size copy of the photo, so undo is instant and memory stays tiny even for big photos.
+function putPatch(base, p, which) { const cx = base.getContext('2d'); cx.clearRect(p.x, p.y, p.w, p.h); cx.drawImage(p[which], p.x, p.y); }
+function histBytes() {
+  const seen = new Set(); let n = 0;
+  for (const e of S.hist) { if (e.base && !seen.has(e.base)) { seen.add(e.base); n += e.base.width * e.base.height * 4; } if (e.patch) n += e.patch.w * e.patch.h * 8; }
+  if (S.orig && !seen.has(S.orig)) n += S.orig.width * S.orig.height * 4;
+  return n;
+}
+function trimHist() {
+  const budget = PERF.histMB * 1048576;
+  while (S.hist.length > 2 && (S.hist.length > PERF.hist || histBytes() > budget)) {
+    const old = S.hist.shift(); S.hi--;
+    const b = old.base; // free pixel memory that nothing references any more (browsers release canvas memory lazily)
+    if (b && b !== S.base && b !== S.orig && !S.hist.some(e => e.base === b)) { b.width = b.height = 0; }
+  }
+  S.hi = S.hist.length - 1;
+}
+function pushEntry(e) { S.hist = S.hist.slice(0, S.hi + 1); S.hist.push(e); S.hi = S.hist.length - 1; trimHist(); }
+
+
+// ---- retouch brushes (module level so a pending full-resolution job survives leaving the page) -------------------------------
+// Live strokes paint only into the small preview canvas (cheap, so the brush follows the finger at full frame rate). The same
+// dabs are recorded and replayed onto the full-resolution photo in the background, a few milliseconds at a time.
+const scr = [];
+function sc(i, w, h) { let c = scr[i]; if (!c) { c = scr[i] = document.createElement('canvas'); c.getContext('2d', { willReadFrequently: true }); } if (c.width < w) c.width = w; if (c.height < h) c.height = h; return c; }
+function grab(ctx, slot, cx, cy, rr) { const q = Math.max(1, Math.ceil(2 * rr)), c = sc(slot, q, q); c.getContext('2d').clearRect(0, 0, q, q); c.getContext('2d').drawImage(ctx.canvas, cx - rr, cy - rr, q, q, 0, 0, q, q); return { c, q }; }
+let dabBuf = null;
+// R = brush settings {tool,size,strength}, k = scale of ctx relative to base coordinates, u = longest side of the base image.
+function retouchDab(ctx, x, y, k, off, SRC, lp, R, color, u) {
+  const r = Math.max(2, R.size * u / 1000 * k), a = R.strength / 100, t = R.tool, clip = () => { ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.clip(); };
+  ctx.save();
+  if (t === 'blur') { if ('filter' in ctx) { const g = grab(ctx, 0, x, y, r); clip(); ctx.globalAlpha = Math.min(1, a + .2); ctx.filter = `blur(${Math.max(1, r / 5)}px)`; ctx.drawImage(g.c, 0, 0, g.q, g.q, x - r, y - r, g.q, g.q); } }
+  else if (t === 'mosaic') { const g = grab(ctx, 0, x, y, r), b = Math.max(3, r / 3), sw = Math.max(1, Math.ceil(g.q / b)), sm = sc(1, sw, sw), sx = sm.getContext('2d'); sx.clearRect(0, 0, sw, sw); sx.drawImage(g.c, 0, 0, g.q, g.q, 0, 0, sw, sw); clip(); ctx.imageSmoothingEnabled = false; ctx.drawImage(sm, 0, 0, sw, sw, x - r, y - r, g.q, g.q); }
+  else if (t === 'heal') { if ('filter' in ctx) { const g = grab(ctx, 0, x, y, r * 2), o = sc(1, g.q, g.q), oc = o.getContext('2d'); oc.clearRect(0, 0, g.q, g.q); oc.save(); oc.filter = `blur(${Math.max(2, r / 2)}px)`; oc.drawImage(g.c, 0, 0, g.q, g.q, 0, 0, g.q, g.q); oc.restore(); clip(); ctx.globalAlpha = Math.min(1, a + .4); ctx.drawImage(o, 0, 0, g.q, g.q, x - r * 2, y - r * 2, g.q, g.q); } }
+  else if (t === 'sharpen' || t === 'redeye') {
+    const g = grab(ctx, 0, x, y, r), q = g.q, cx = g.c.getContext('2d'), id = cx.getImageData(0, 0, q, q), d = id.data;
+    if (t === 'redeye') { for (let i = 0; i < d.length; i += 4) if (d[i] > 80 && d[i] > 1.5 * Math.max(d[i + 1], d[i + 2])) d[i] = (d[i + 1] + d[i + 2]) / 2 * .8; }
+    else { if (!dabBuf || dabBuf.length < d.length) dabBuf = new Uint8ClampedArray(d.length); const src = dabBuf; src.set(d); const w = a * .8, q4 = q * 4; for (let yy = 1; yy < q - 1; yy++) for (let xx = 1; xx < q - 1; xx++) for (let ch = 0; ch < 3; ch++) { const i = (yy * q + xx) * 4 + ch; d[i] = src[i] * (1 + 4 * w) - w * (src[i - 4] + src[i + 4] + src[i - q4] + src[i + q4]); } }
+    cx.putImageData(id, 0, 0); clip(); ctx.drawImage(g.c, 0, 0, q, q, x - r, y - r, q, q);
+  }
+  else if (t === 'smudge') { if (lp) { const g = grab(ctx, 0, lp.x * k, lp.y * k, r); clip(); ctx.globalAlpha = Math.min(.9, a + .2); ctx.drawImage(g.c, 0, 0, g.q, g.q, x - r, y - r, g.q, g.q); } }
+  else if (t === 'paint') { clip(); ctx.globalAlpha = a; ctx.fillStyle = color; ctx.fillRect(x - r, y - r, 2 * r, 2 * r); }
+  else if (t === 'saturate' || t === 'desaturate') { const g = ctx.createRadialGradient(x, y, 0, x, y, r), col = t === 'saturate' ? '255,0,0' : '128,128,128'; ctx.globalCompositeOperation = 'saturation'; g.addColorStop(0, `rgba(${col},${a * .25})`); g.addColorStop(1, `rgba(${col},0)`); ctx.fillStyle = g; ctx.fillRect(x - r, y - r, 2 * r, 2 * r); }
+  else if (t === 'clone') { clip(); ctx.globalAlpha = Math.min(1, a + .3); ctx.drawImage(SRC, (x - r) / k + off.x, (y - r) / k + off.y, 2 * r / k, 2 * r / k, x - r, y - r, 2 * r, 2 * r); }
+  else { const col = t === 'dodge' ? '255,255,255' : '0,0,0', g = ctx.createRadialGradient(x, y, 0, x, y, r); ctx.globalCompositeOperation = t === 'dodge' ? 'screen' : t === 'burn' ? 'multiply' : 'destination-out'; g.addColorStop(0, `rgba(${col},${t === 'erase' ? Math.min(1, a + .3) : a * .2})`); g.addColorStop(1, `rgba(${col},0)`); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill(); }
+  ctx.restore();
+}
+// Background queue that applies recorded strokes to the full-resolution photo. Anything that needs the final pixels
+// (undo, export, crop, new history entry …) calls flushJobs() first, which finishes the queue synchronously.
+const jobs = []; let runner = null; const jobHooks = { done: null };
+const jobsPending = () => !!(runner && !runner.finished) || jobs.length > 0;
+function* runAll() { while (jobs.length) yield* retouchGen(jobs.shift()); }
+function* retouchGen(job) {
+  let C = S.base; if (!job.SRC || !job.SRC.width) job.SRC = C;
+  if (!owned.has(C)) { C = copyCanvas(S.base); owned.add(C); yield; } // one-time private copy; later strokes edit it in place
+  const u = Math.max(C.width, C.height), R = job.R, rr = Math.max(2, R.size * u / 1000) * (R.tool === 'heal' ? 2 : 1) + 4;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const d of job.dabs) { if (d.x - rr < x0) x0 = d.x - rr; if (d.y - rr < y0) y0 = d.y - rr; if (d.x + rr > x1) x1 = d.x + rr; if (d.y + rr > y1) y1 = d.y + rr; }
+  const bx = Math.max(0, Math.floor(x0)), by = Math.max(0, Math.floor(y0)), bw = Math.min(C.width, Math.ceil(x1)) - bx, bh = Math.min(C.height, Math.ceil(y1)) - by;
+  if (!(bw > 0 && bh > 0)) return;
+  const before = cutCanvas(C, bx, by, bw, bh), cx = C.getContext('2d'); let n = 0;
+  yield;
+  for (const d of job.dabs) { retouchDab(cx, d.x, d.y, 1, job.off, job.SRC, d.lp, R, job.color, u); if ((++n & 3) === 0) yield; }
+  const after = cutCanvas(C, bx, by, bw, bh);
+  S.base = C; S.rev++; pushEntry({ ...job.meta, base: C, patch: { x: bx, y: by, w: bw, h: bh, before, after } });
+  jobHooks.done && jobHooks.done();
+}
+function queueRetouch(job) { jobs.push(job); if (!runner || runner.finished) runner = sliceJob(runAll(), 6); }
+function flushJobs() { if (runner && !runner.finished) runner.flush(); runner = null; }
 
 export async function mount(root) {
-  let pvSrc = null, pvVer = -1, raf = 0, crop = null, cropRatio = 0, drag = null, disposed = false;
+  let pvSrc = null, pvVer = -1, pvRev = 0, raf = 0, crop = null, cropRatio = 0, drag = null, disposed = false, fastNext = false, settleT = 0;
+  const gov = makeGovernor(), work = { full: { key: '' }, low: { key: '' } };
+  const pushHist = () => { flushJobs(); pushEntry(snapshot()); };
+  const setDis = (b, v) => { if (b.disabled !== v) b.disabled = v; }; // writing the same value still fires DOM mutation observers
+  calibrate();
   const pv = h('canvas', { class: 'pe-canvas', 'aria-label': L('Photo preview', 'معاينة الصورة') });
   const cropBox = h('div', { class: 'crop-box', hidden: true }, ['nw', 'ne', 'sw', 'se'].map(c => h('i', { class: 'crop-h ' + c, 'data-h': c })));
   const inner = h('div', { class: 'pe-inner' }, pv, cropBox);
@@ -85,9 +167,11 @@ export async function mount(root) {
   const setZoom = (z) => { S.zoom = clamp(z, 0.25, 8); render(); };
   const zoomLbl = h('button', { class: 'btn sm', title: L('Fit to screen', 'ملاءمة الشاشة'), onclick: () => setZoom(1) }, L('Fit', 'ملاءمة'));
   const zoomOutB = h('button', { class: 'btn sm', 'aria-label': L('Zoom out', 'تصغير'), onclick: () => setZoom(S.zoom / 1.5) }, '−'), zoomInB = h('button', { class: 'btn sm', 'aria-label': L('Zoom in', 'تكبير'), onclick: () => setZoom(S.zoom * 1.5) }, '+');
+  let zApplied = '';
   function applyZoom() {
-    if (S.zoom === 1) { pv.style.width = pv.style.maxWidth = inner.style.maxWidth = ''; zoomLbl.textContent = L('Fit', 'ملاءمة'); return; }
-    const fw = Math.min(stage.clientWidth - 40, (stage.clientHeight - 40) * S.base.width / S.base.height); pv.style.maxWidth = inner.style.maxWidth = 'none'; pv.style.width = Math.max(60, fw * S.zoom) + 'px'; zoomLbl.textContent = Math.round(S.zoom * 100) + '%';
+    if (S.zoom === 1) { if (zApplied !== '1') { pv.style.width = pv.style.maxWidth = inner.style.maxWidth = ''; zoomLbl.textContent = L('Fit', 'ملاءمة'); zApplied = '1'; } return; }
+    const fw = Math.min(stage.clientWidth - 40, (stage.clientHeight - 40) * S.base.width / S.base.height), wpx = Math.max(60, fw * S.zoom) + 'px';
+    if (zApplied !== wpx) { pv.style.maxWidth = inner.style.maxWidth = 'none'; pv.style.width = wpx; zoomLbl.textContent = Math.round(S.zoom * 100) + '%'; zApplied = wpx; }
   }
   const fileBtn = h('button', { class: 'btn sm', onclick: () => dz.open() }, icon('image-plus'), h('span', { class: 'hide-sm' }, L('New photo', 'صورة جديدة')));
   const exportB = h('button', { class: 'btn primary sm', onclick: exportDialog }, icon('download'), h('span', { class: 'hide-sm' }, L('Export', 'تصدير')));
@@ -114,41 +198,85 @@ export async function mount(root) {
     const f = files[0]; if (!f) return;
     if (S.base && S.hist.length > 1 && !(await confirmDialog({ title: L('Open a new photo?', 'فتح صورة جديدة؟'), message: L('Your current edits will be discarded.', 'سيتم تجاهل تعديلاتك الحالية.'), confirmText: L('Open', 'فتح'), danger: true }))) return;
     const v = await validateImage(f); if (!v.ok) return toast(v.error, 'error');
-    stage.classList.add('busy');
+    flushJobs(); stage.classList.add('busy');
     try {
-      const c = await fileToCanvas(f, MAX_DIM);
-      if (c.srcWidth > MAX_DIM || c.srcHeight > MAX_DIM) toast(L('Large photo reduced to ' + MAX_DIM + ' px on its longest side for stability.', 'تم تصغير الصورة الكبيرة إلى ' + MAX_DIM + ' بكسل للضلع الأطول لضمان الاستقرار.'));
+      const MAX_DIM = PERF.maxDim, c = await fileToCanvas(f, MAX_DIM);
+      if (c.srcWidth > MAX_DIM || c.srcHeight > MAX_DIM) toast(L('Large photo reduced to ' + MAX_DIM + ' px on its longest side so editing stays smooth on this device.', 'تم تصغير الصورة الكبيرة إلى ' + MAX_DIM + ' بكسل للضلع الأطول ليبقى التحرير سلساً على هذا الجهاز.'));
       else if (c.width * c.height > 24e6) toast(L('This is a very large photo; editing may feel slower.', 'هذه صورة كبيرة جداً؛ قد يكون التحرير أبطأ.'));
-      S.base = c; S.orig = c; S.name = baseName(f.name); S.overlays = []; S.params = { ...DEFAULT_PARAMS }; S.fx = { ...FXD }; S.filter = 'none'; S.amt = 100; S.sel = -1; S.ver++; S.hist = []; S.hi = -1; S.compare = false;
+      S.base = c; S.orig = c; S.rev = 0; S.name = baseName(f.name); S.overlays = []; S.params = { ...DEFAULT_PARAMS }; S.fx = { ...FXD }; S.filter = 'none'; S.amt = 100; S.sel = -1; S.ver++; S.hist = []; S.hi = -1; S.compare = false;
       pushHist(); build();
     } catch (e) { toast(e.message, 'error'); } finally { stage.classList.remove('busy'); }
   }
 
   // ---- preview
+  // Pipeline: base → (downscaled once) pvSrc → tone/filter/effects cache → + overlays → screen.
+  //  • The tone/effects result is cached; moving, drawing or editing overlays never recomputes pixels.
+  //  • While a slider is being dragged the cache is rebuilt at an adaptive lower resolution (governor) so each frame stays
+  //    inside the time budget, then refined to full preview quality once the user pauses.
+  // Preview resolution follows what the screen can actually show (stage size × pixel ratio × zoom), capped by the device tier.
+  // On a phone that is ~400–800 px instead of 1400, which cuts every per-frame cost (pixel math, upload, compositing) 3–10×.
+  const prevDim = () => Math.round(Math.max(480, Math.min(PERF.prevDim, Math.max(stage.clientWidth, stage.clientHeight, 320) * PERF.dprCap * Math.max(1, S.zoom))));
   function rebuildPrev() {
-    const k = Math.min(1, PREV_DIM / Math.max(S.base.width, S.base.height));
-    pvSrc = document.createElement('canvas'); pvSrc.width = Math.max(1, Math.round(S.base.width * k)); pvSrc.height = Math.max(1, Math.round(S.base.height * k));
-    const c = pvSrc.getContext('2d'); c.imageSmoothingQuality = 'high'; c.drawImage(S.base, 0, 0, pvSrc.width, pvSrc.height); pvVer = S.ver;
+    const k = Math.min(1, prevDim() / Math.max(S.base.width, S.base.height));
+    if (!pvSrc) pvSrc = document.createElement('canvas');
+    pvSrc.width = Math.max(1, Math.round(S.base.width * k)); pvSrc.height = Math.max(1, Math.round(S.base.height * k));
+    const c = pvSrc.getContext('2d'); c.imageSmoothingQuality = PERF.tier === 'low' ? 'medium' : 'high'; c.clearRect(0, 0, pvSrc.width, pvSrc.height); c.drawImage(S.base, 0, 0, pvSrc.width, pvSrc.height); pvVer = S.ver; pvRev++;
   }
-  const schedule = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; if (!disposed) render(); }); };
-  function render() {
-    if (!S.base) return; if (pvVer !== S.ver || !pvSrc) rebuildPrev();
+  // Render tone + effects of pvSrc at w × hh into wk.cv (cached source pixels, reusable output buffer — no per-frame allocation).
+  function runWork(wk, w, hh, sk, key) {
+    if (!wk.cv) wk.cv = document.createElement('canvas');
+    if (wk.cv.width !== w || wk.cv.height !== hh) { wk.cv.width = w; wk.cv.height = hh; wk.cx = null; wk.src = null; wk.dst = null; }
+    if (!wk.cx) wk.cx = wk.cv.getContext('2d', { willReadFrequently: true });
+    const cx = wk.cx;
+    if (hasTone()) {
+      if (!wk.src || wk.sk !== sk) {
+        cx.clearRect(0, 0, w, hh); cx.imageSmoothingQuality = 'low'; cx.drawImage(pvSrc, 0, 0, pvSrc.width, pvSrc.height, 0, 0, w, hh);
+        wk.src = cx.getImageData(0, 0, w, hh); wk.sk = sk; if (!wk.dst) wk.dst = cx.createImageData(w, hh);
+      }
+      adjustPixels(wk.dst.data, w, hh, S.params, S.filter, S.amt, wk.src.data); cx.putImageData(wk.dst, 0, 0);
+    } else { cx.clearRect(0, 0, w, hh); cx.imageSmoothingQuality = 'low'; cx.drawImage(pvSrc, 0, 0, pvSrc.width, pvSrc.height, 0, 0, w, hh); wk.src = null; }
+    applyFx(cx, w, hh); wk.key = key; return wk.cv;
+  }
+  function layer(fast) {
+    const tone = hasTone(), fx = fxActive(S.fx); if (!tone && !fx) return pvSrc;
+    const p = S.params, sk = S.ver + '.' + S.rev + '.' + pvRev, key = sk + '|' + S.filter + S.amt + '|' + p.brightness + ',' + p.contrast + ',' + p.saturation + ',' + p.exposure + ',' + p.warmth + ',' + p.sharpness + '|' + Object.values(S.fx).join();
+    if (work.full.key === key) return work.full.cv;
+    const W = pvSrc.width, H = pvSrc.height;
+    if (!fast) return runWork(work.full, W, H, sk, key);
+    const q = gov.q, t0 = performance.now();
+    if (q >= 0.98) { const cv = runWork(work.full, W, H, sk, key); gov.record(performance.now() - t0, 1); return cv; }
+    const w = Math.max(16, Math.round(W * q)), hh = Math.max(16, Math.round(H * q)), cv = runWork(work.low, w, hh, sk + '@' + w, key);
+    gov.record(performance.now() - t0, w / W); return cv;
+  }
+  const schedule = (fast = true) => { fastNext = fastNext || fast; if (!raf) raf = requestAnimationFrame(frame); };
+  function frame() {
+    raf = 0; if (disposed) return;
+    if (rts && rts.pend) stepRt(rts);
+    const fast = fastNext; fastNext = false; render(fast);
+    if (fast) { clearTimeout(settleT); settleT = setTimeout(() => { if (!disposed) render(false); }, Math.min(600, Math.max(140, gov.fullMs * 2.5))); }
+  }
+  function render(fast) {
+    if (!S.base) return;
+    if (pvSrc && !rts && !jobsPending()) { const want = Math.min(1, prevDim() / Math.max(S.base.width, S.base.height)), have = pvSrc.width / S.base.width; if (want > have * 1.25 || want < have * 0.6) pvVer = -1; } // zoomed / resized: re-derive
+    if (pvVer !== S.ver || !pvSrc) rebuildPrev();
     const w = pvSrc.width, hh = pvSrc.height; if (pv.width !== w || pv.height !== hh) { pv.width = w; pv.height = hh; }
-    const ctx = pv.getContext('2d'); ctx.clearRect(0, 0, w, hh); ctx.drawImage(pvSrc, 0, 0);
-    if (!S.compare) {
-      if (S.filter !== 'none' || Object.values(S.params).some(v => v)) { const id = ctx.getImageData(0, 0, w, hh); adjustPixels(id.data, w, hh, S.params, S.filter, S.amt); ctx.putImageData(id, 0, 0); }
-      applyFx(ctx, w, hh);
-      drawOverlays(ctx, w / S.base.width, !crop);
-    }
-    applyZoom(); info.textContent = S.base.width + ' × ' + S.base.height + ' px';
-    undoB.disabled = S.hi <= 0; redoB.disabled = S.hi >= S.hist.length - 1; if (crop) placeCrop();
+    const ctx = pv.getContext('2d'); ctx.clearRect(0, 0, w, hh);
+    if (S.compare) ctx.drawImage(pvSrc, 0, 0);
+    else { const src = layer(fast); ctx.imageSmoothingEnabled = true; ctx.drawImage(src, 0, 0, src.width, src.height, 0, 0, w, hh); drawOverlays(ctx, w / S.base.width, !crop); }
+    applyZoom(); const txt = (jobsPending() ? L('Applying brush… · ', 'جارٍ تطبيق الفرشاة… · ') : '') + S.base.width + ' × ' + S.base.height + ' px'; if (info.textContent !== txt) info.textContent = txt;
+    setDis(undoB, S.hi <= 0); setDis(redoB, S.hi >= S.hist.length - 1); if (crop) placeCrop();
   }
+  jobHooks.done = () => { if (!disposed) { schedule(false); renderPanelSoon(); } };
+  let panelT = 0; const renderPanelSoon = () => { clearTimeout(panelT); panelT = setTimeout(() => { if (!disposed && !rts) renderPanel(); }, 120); };
   function go(i) {
-    if (i < 0 || i >= S.hist.length) return; endCrop();
-    const s = S.hist[i], baseChanged = s.base !== S.base; S.hi = i; S.base = s.base; S.overlays = clone(s.overlays); S.params = { ...s.params }; S.filter = s.filter; S.amt = s.amt; S.fx = { ...(s.fx || FXD) }; S.sel = -1; if (baseChanged) S.ver++;
-    renderPanel(); render();
+    flushJobs(); if (i < 0 || i >= S.hist.length || i === S.hi) return; endCrop();
+    let touched = false;
+    if (i < S.hi) { for (let j = S.hi; j > i; j--) { const pt = S.hist[j].patch; if (pt) { putPatch(S.hist[j].base, pt, 'before'); touched = true; } } }
+    else { for (let j = S.hi + 1; j <= i; j++) { const pt = S.hist[j].patch; if (pt) { putPatch(S.hist[j].base, pt, 'after'); touched = true; } } }
+    const s = S.hist[i], baseChanged = s.base !== S.base; S.hi = i; S.base = s.base; S.overlays = clone(s.overlays); S.params = { ...s.params }; S.filter = s.filter; S.amt = s.amt; S.fx = { ...(s.fx || FXD) }; S.sel = -1; if (baseChanged || touched) S.ver++;
+    renderPanel(); render(false);
   }
-  const commit = () => { pushHist(); render(); };
+  const commit = () => { pushHist(); render(false); };
 
   // ---- overlay interaction
   const toBase = (e) => { const r = pv.getBoundingClientRect(); return { x: (e.clientX - r.left) / r.width * S.base.width, y: (e.clientY - r.top) / r.height * S.base.height }; };
@@ -167,36 +295,25 @@ export async function mount(root) {
     render();
   });
   let stroke = null, rts = null;
-  function dab(ctx, x, y, k, off, SRC, lp) {
-    const R = S.rt, r = Math.max(2, R.size * uDim() / 1000 * k), a = R.strength / 100, t = R.tool, cl = () => { ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.clip(); };
-    const reg = (cx = x, cy = y, m = 1) => { const c = document.createElement('canvas'), q = Math.ceil(2 * r * m); c.width = c.height = q; c.getContext('2d').drawImage(ctx.canvas, cx - r * m, cy - r * m, q, q, 0, 0, q, q); return c; };
-    ctx.save();
-    if (t === 'blur') { if ('filter' in ctx) { const c = reg(); cl(); ctx.globalAlpha = Math.min(1, a + .2); ctx.filter = `blur(${Math.max(1, r / 5)}px)`; ctx.drawImage(c, x - r, y - r); } }
-    else if (t === 'mosaic') { const c = reg(), b = Math.max(3, r / 3), sm = document.createElement('canvas'); sm.width = sm.height = Math.max(1, Math.ceil(c.width / b)); sm.getContext('2d').drawImage(c, 0, 0, sm.width, sm.height); cl(); ctx.imageSmoothingEnabled = false; ctx.drawImage(sm, x - r, y - r, c.width, c.height); }
-    else if (t === 'heal') { if ('filter' in ctx) { const c = reg(x, y, 2), o = document.createElement('canvas'); o.width = o.height = c.width; const oc = o.getContext('2d'); oc.filter = `blur(${Math.max(2, r / 2)}px)`; oc.drawImage(c, 0, 0); cl(); ctx.globalAlpha = Math.min(1, a + .4); ctx.drawImage(o, x - r * 2, y - r * 2); } }
-    else if (t === 'sharpen' || t === 'redeye') {
-      const c = reg(), cx = c.getContext('2d'), id = cx.getImageData(0, 0, c.width, c.height), d = id.data, q = c.width, src = new Uint8ClampedArray(d);
-      if (t === 'redeye') { for (let i = 0; i < d.length; i += 4) if (d[i] > 80 && d[i] > 1.5 * Math.max(d[i + 1], d[i + 2])) d[i] = (d[i + 1] + d[i + 2]) / 2 * .8; }
-      else { const w = a * .8; for (let yy = 1; yy < q - 1; yy++) for (let xx = 1; xx < q - 1; xx++) for (let ch = 0; ch < 3; ch++) { const i = (yy * q + xx) * 4 + ch; d[i] = src[i] * (1 + 4 * w) - w * (src[i - 4] + src[i + 4] + src[i - q * 4] + src[i + q * 4]); } }
-      cx.putImageData(id, 0, 0); cl(); ctx.drawImage(c, x - r, y - r);
-    }
-    else if (t === 'smudge') { if (lp) { const c = reg(lp.x * k, lp.y * k); cl(); ctx.globalAlpha = Math.min(.9, a + .2); ctx.drawImage(c, x - r, y - r); } }
-    else if (t === 'paint') { cl(); ctx.globalAlpha = a; ctx.fillStyle = S.dr.color; ctx.fillRect(x - r, y - r, 2 * r, 2 * r); }
-    else if (t === 'saturate' || t === 'desaturate') { const g = ctx.createRadialGradient(x, y, 0, x, y, r), col = t === 'saturate' ? '255,0,0' : '128,128,128'; ctx.globalCompositeOperation = 'saturation'; g.addColorStop(0, `rgba(${col},${a * .25})`); g.addColorStop(1, `rgba(${col},0)`); ctx.fillStyle = g; ctx.fillRect(x - r, y - r, 2 * r, 2 * r); }
-    else if (t === 'clone') { cl(); ctx.globalAlpha = Math.min(1, a + .3); ctx.drawImage(SRC, (x - r) / k + off.x, (y - r) / k + off.y, 2 * r / k, 2 * r / k, x - r, y - r, 2 * r, 2 * r); }
-    else { const col = t === 'dodge' ? '255,255,255' : '0,0,0', g = ctx.createRadialGradient(x, y, 0, x, y, r); ctx.globalCompositeOperation = t === 'dodge' ? 'screen' : t === 'burn' ? 'multiply' : 'destination-out'; g.addColorStop(0, `rgba(${col},${t === 'erase' ? Math.min(1, a + .3) : a * .2})`); g.addColorStop(1, `rgba(${col},0)`); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill(); }
-    ctx.restore();
-  }
-  function dabAt(p) { const k = pvSrc.width / S.base.width, lp = rts.dp; dab(rts.W.getContext('2d'), p.x, p.y, 1, rts.off, rts.SRC, lp); dab(pvSrc.getContext('2d'), p.x * k, p.y * k, k, rts.off, rts.SRC, lp); rts.dp = p; schedule(); }
+  function dabAt(p, j) { const k = pvSrc.width / S.base.width; retouchDab(pvSrc.getContext('2d'), p.x * k, p.y * k, k, j.off, j.SRC, j.dp, j.R, j.color, uDim()); j.dabs.push({ x: p.x, y: p.y, lp: j.dp }); j.dp = p; pvRev++; }
   function startRt(e) {
     const p = toBase(e), R = S.rt; e.preventDefault();
     if (R.tool === 'clone' && (R.setSrc || !R.src)) { R.src = p; R.setSrc = false; toast(L('Clone source set. Now paint where you want to copy to.', 'تم تحديد المصدر. ارسم الآن حيث تريد النسخ.')); renderPanel(); return; }
     if (pvVer !== S.ver || !pvSrc) rebuildPrev(); pv.setPointerCapture(e.pointerId);
-    const W = document.createElement('canvas'); W.width = S.base.width; W.height = S.base.height; W.getContext('2d').drawImage(S.base, 0, 0);
-    rts = { W, SRC: S.base, off: R.tool === 'clone' ? { x: R.src.x - p.x, y: R.src.y - p.y } : null, last: p }; dabAt(p);
+    rts = { R: { tool: R.tool, size: R.size, strength: R.strength }, color: S.dr.color, SRC: S.base, off: R.tool === 'clone' ? { x: R.src.x - p.x, y: R.src.y - p.y } : null, dabs: [], last: p, pend: null, dp: null, cap: PERF.dabs };
+    dabAt(p, rts); schedule(true);
   }
-  function moveRt(e) { const p = toBase(e), r = Math.max(2, S.rt.size * uDim() / 1000), n = Math.min(60, Math.ceil(Math.hypot(p.x - rts.last.x, p.y - rts.last.y) / (r / 3))); for (let i = 1; i <= n; i++) dabAt({ x: rts.last.x + (p.x - rts.last.x) * i / n, y: rts.last.y + (p.y - rts.last.y) * i / n }); rts.last = p; }
-  const endRt = () => { if (!rts) return; S.base = rts.W; rts = null; S.ver++; commit(); };
+  // Pointer events only record the latest position; the dabs are laid down once per animation frame, with a per-frame cap that
+  // adapts to how long the previous frame took, so slow devices drop spacing density instead of dropping frames.
+  function moveRt(e) { rts.pend = toBase(e); schedule(true); }
+  function stepRt(j) {
+    const p = j.pend; j.pend = null; if (!p) return;
+    const r = Math.max(2, j.R.size * uDim() / 1000), dist = Math.hypot(p.x - j.last.x, p.y - j.last.y); if (dist < 0.5) return;
+    const n = Math.max(1, Math.min(j.cap, Math.ceil(dist / (r / 3)))), t0 = performance.now();
+    for (let i = 1; i <= n; i++) dabAt({ x: j.last.x + (p.x - j.last.x) * i / n, y: j.last.y + (p.y - j.last.y) * i / n }, j);
+    j.last = p; const ms = performance.now() - t0; j.cap = ms > 9 ? Math.max(3, Math.floor(j.cap * 0.7)) : Math.min(PERF.dabs, j.cap + 1);
+  }
+  const endRt = () => { if (!rts) return; const j = rts; stepRt(j); rts = null; j.meta = snapshot(); queueRetouch(j); schedule(false); };
   pv.addEventListener('pointerup', endRt); pv.addEventListener('pointercancel', endRt);
   const uDim = () => Math.max(S.base.width, S.base.height);
   function eraseAt(p) {
@@ -245,14 +362,14 @@ export async function mount(root) {
   });
   const endCd = () => { cd = null; }; cropBox.addEventListener('pointerup', endCd); cropBox.addEventListener('pointercancel', endCd);
   function applyCrop() {
-    const x = Math.round(crop.x), y = Math.round(crop.y), w = Math.max(1, Math.round(crop.w)), hh = Math.max(1, Math.round(crop.h));
+    flushJobs(); const x = Math.round(crop.x), y = Math.round(crop.y), w = Math.max(1, Math.round(crop.w)), hh = Math.max(1, Math.round(crop.h));
     const c = document.createElement('canvas'); c.width = w; c.height = hh; c.getContext('2d').drawImage(S.base, x, y, w, hh, 0, 0, w, hh);
-    S.overlays.forEach(o => { if (o.pts) o.pts = o.pts.map(([a, b]) => [a - x, b - y]); else { o.x -= x; o.y -= y; } }); S.base = c; S.ver++; S.sel = -1; endCrop(); commit(); renderPanel();
+    S.overlays.forEach(o => { if (o.pts) o.pts = o.pts.map(([a, b]) => [a - x, b - y]); else { o.x -= x; o.y -= y; } }); owned.add(c); S.base = c; S.ver++; S.sel = -1; endCrop(); commit(); renderPanel();
   }
 
   // ---- transforms
   function transform(kind) {
-    const b = S.base, bw = b.width, bh = b.height, c = document.createElement('canvas'), rot = kind === 'cw' || kind === 'ccw';
+    flushJobs(); const b = S.base, bw = b.width, bh = b.height, c = document.createElement('canvas'), rot = kind === 'cw' || kind === 'ccw';
     c.width = rot ? bh : bw; c.height = rot ? bw : bh; const ctx = c.getContext('2d');
     if (kind === 'cw') { ctx.translate(bh, 0); ctx.rotate(Math.PI / 2); } else if (kind === 'ccw') { ctx.translate(0, bw); ctx.rotate(-Math.PI / 2); }
     else if (kind === 'fh') { ctx.translate(bw, 0); ctx.scale(-1, 1); } else { ctx.translate(0, bh); ctx.scale(1, -1); }
@@ -262,15 +379,15 @@ export async function mount(root) {
       if (o.pts) { o.pts = o.pts.map(([a, b]) => f(a, b)); return; }
       [o.x, o.y] = f(o.x, o.y); if (kind === 'cw') o.rot += 90; else if (kind === 'ccw') o.rot -= 90; else o.rot = -o.rot;
     });
-    S.base = c; S.ver++; S.sel = -1; endCrop(); commit(); renderPanel();
+    owned.add(c); S.base = c; S.ver++; S.sel = -1; endCrop(); commit(); renderPanel();
   }
   function resizeTo(nw, nh) {
-    const bw = S.base.width, bh = S.base.height;
+    flushJobs(); const bw = S.base.width, bh = S.base.height;
     if (!(nw >= 1 && nh >= 1) || nw > 10000 || nh > 10000 || nw * nh > 60e6) return toast(L('Choose a size between 1 and 10,000 px (max 60 megapixels).', 'اختر مقاساً بين 1 و10,000 بكسل (حد أقصى 60 ميغابكسل).'), 'error');
     const c = document.createElement('canvas'); c.width = nw; c.height = nh; const ctx = c.getContext('2d'); ctx.imageSmoothingQuality = 'high'; ctx.drawImage(S.base, 0, 0, nw, nh);
     const kx = nw / bw, ky = nh / bh;
     S.overlays.forEach(o => { if (o.pts) o.pts = o.pts.map(([a, b]) => [a * kx, b * ky]); o.x *= kx; o.y *= ky; if (o.size) o.size *= kx; if (o.w) { o.w *= kx; o.h *= ky; } o.sw = (o.sw || 0) * kx; });
-    S.base = c; S.ver++; commit(); renderPanel(); toast(L('Resized to ' + nw + ' × ' + nh + ' px.', 'تم تغيير الحجم إلى ' + nw + ' × ' + nh + ' بكسل.'), 'success');
+    owned.add(c); S.base = c; S.ver++; commit(); renderPanel(); toast(L('Resized to ' + nw + ' × ' + nh + ' px.', 'تم تغيير الحجم إلى ' + nw + ' × ' + nh + ' بكسل.'), 'success');
   }
 
   // ---- panel
@@ -290,11 +407,15 @@ export async function mount(root) {
     return h('div', null, h('button', { class: 'btn sm primary', onclick: autoEnhance }, icon('sparkles'), L('Auto enhance', 'تحسين تلقائي')), ADJ.map(([k, en, ar]) => slider(L(en, ar), S.params[k], k === 'sharpness' ? 0 : -100, 100, 1, v => { S.params[k] = v; schedule(); }, commit, () => { S.params[k] = 0; commit(); renderPanel(); })),
       h('button', { class: 'btn sm', onclick: () => { S.params = { ...DEFAULT_PARAMS }; S.fx = { ...FXD }; S.filter = 'none'; S.amt = 100; commit(); renderPanel(); toast(L('All adjustments reset.', 'تمت إعادة ضبط كل التعديلات.')); } }, icon('rotate-ccw'), L('Reset all adjustments', 'إعادة ضبط كل التعديلات')));
   }
-  let thumbs = null, thumbVer = -1;
+  let thumbs = null, thumbKey = '';
   function filtersView() {
-    if (thumbVer !== S.ver || !thumbs) {
-      thumbs = {}; const k = 96 / Math.max(S.base.width, S.base.height);
-      FILTERS.forEach(f => { const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(S.base.width * k)); c.height = Math.max(1, Math.round(S.base.height * k)); const x = c.getContext('2d'); x.drawImage(S.base, 0, 0, c.width, c.height); if (f !== 'none') { const id = x.getImageData(0, 0, c.width, c.height); adjustPixels(id.data, c.width, c.height, DEFAULT_PARAMS, f, 100); x.putImageData(id, 0, 0); } thumbs[f] = c; }); thumbVer = S.ver;
+    const tk = S.ver + '.' + S.rev;
+    if (thumbKey !== tk || !thumbs) {
+      // Build the 8 small previews from the already-downscaled preview canvas, not from the (possibly 36 MP) photo.
+      if (pvVer !== S.ver || !pvSrc) rebuildPrev();
+      thumbs = {}; const k = 96 / Math.max(pvSrc.width, pvSrc.height), tw = Math.max(1, Math.round(pvSrc.width * k)), th = Math.max(1, Math.round(pvSrc.height * k));
+      const t0 = document.createElement('canvas'); t0.width = tw; t0.height = th; const c0 = t0.getContext('2d', { willReadFrequently: true }); c0.drawImage(pvSrc, 0, 0, tw, th);
+      FILTERS.forEach(f => { const c = document.createElement('canvas'); c.width = tw; c.height = th; const x = c.getContext('2d', { willReadFrequently: true }); x.drawImage(t0, 0, 0); if (f !== 'none') { const id = x.getImageData(0, 0, tw, th); adjustPixels(id.data, tw, th, DEFAULT_PARAMS, f, 100); x.putImageData(id, 0, 0); } thumbs[f] = c; }); thumbKey = tk;
     }
     return h('div', null, h('div', { class: 'grid filters' }, FILTERS.map(f => h('button', { class: 'filter' + (S.filter === f ? ' active' : ''), 'aria-pressed': S.filter === f, onclick: () => { S.filter = f; S.amt = 100; commit(); renderPanel(); } }, thumbs[f], h('span', null, L(...FNAMES[f]))))),
       S.filter !== 'none' ? slider(L('Intensity', 'الشدة'), S.amt, 0, 100, 1, v => { S.amt = v; schedule(); }, commit) : null);
@@ -317,7 +438,7 @@ export async function mount(root) {
       h('button', { class: 'btn sm', onclick: () => transform('fh') }, icon('flip-horizontal-2'), L('Flip H', 'قلب أفقي')), h('button', { class: 'btn sm', onclick: () => transform('fv') }, icon('flip-vertical-2'), L('Flip V', 'قلب رأسي')))),
       straightenSec(), h('div', { class: 'sec' }, h('h4', null, L('Resize (pixels)', 'تغيير الحجم (بكسل)')), h('div', { class: 'row' }, field(L('Width', 'العرض'), wI), field(L('Height', 'الارتفاع'), hI)),
         h('label', { class: 'check' }, lk, L('Maintain aspect ratio', 'الحفاظ على نسبة الأبعاد')), h('button', { class: 'btn sm', onclick: () => resizeTo(parseInt(wI.value), parseInt(hI.value)) }, L('Apply size', 'تطبيق الحجم'))),
-      h('div', { class: 'sec' }, h('button', { class: 'btn sm danger-o', onclick: async () => { if (await confirmDialog({ title: L('Revert to original?', 'العودة للأصل؟'), message: L('All edits, including crops and overlays, will be removed.', 'ستتم إزالة كل التعديلات بما فيها القص والعناصر المضافة.'), confirmText: L('Revert', 'عودة'), danger: true })) { S.base = S.orig; S.overlays = []; S.params = { ...DEFAULT_PARAMS }; S.fx = { ...FXD }; S.filter = 'none'; S.sel = -1; S.ver++; endCrop(); commit(); renderPanel(); } } }, L('Revert to original', 'العودة إلى الأصل'))));
+      h('div', { class: 'sec' }, h('button', { class: 'btn sm danger-o', onclick: async () => { if (await confirmDialog({ title: L('Revert to original?', 'العودة للأصل؟'), message: L('All edits, including crops and overlays, will be removed.', 'ستتم إزالة كل التعديلات بما فيها القص والعناصر المضافة.'), confirmText: L('Revert', 'عودة'), danger: true })) { flushJobs(); S.base = S.orig; S.overlays = []; S.params = { ...DEFAULT_PARAMS }; S.fx = { ...FXD }; S.filter = 'none'; S.sel = -1; S.ver++; endCrop(); commit(); renderPanel(); } } }, L('Revert to original', 'العودة إلى الأصل'))));
   }
   function drawView() {
     const D = S.dr, T = [['pen', 'pencil', L('Pen', 'قلم')], ['highlighter', 'brush', L('Highlighter', 'تظليل')], ['eraser', 'eraser', L('Eraser', 'ممحاة')]];
@@ -345,11 +466,11 @@ export async function mount(root) {
     S.params = { ...S.params, contrast: Math.round(clamp((255 / Math.max(40, hi - lo) - 1) * 70, 0, 60)), brightness: Math.round(clamp((128 - (lo + hi) / 2) / 2.55 * .7, -30, 30)), saturation: 12 }; commit(); renderPanel(); toast(L('Auto enhance applied.', 'تم التحسين التلقائي.'), 'success');
   }
   function straighten(deg) {
-    if (!deg) return; const b = S.base, w = b.width, hh = b.height, a = deg * Math.PI / 180, sc = Math.abs(Math.cos(a)) + Math.abs(Math.sin(a)) * Math.max(w / hh, hh / w), c = document.createElement('canvas'); c.width = w; c.height = hh;
+    if (!deg) return; flushJobs(); const b = S.base, w = b.width, hh = b.height, a = deg * Math.PI / 180, sc = Math.abs(Math.cos(a)) + Math.abs(Math.sin(a)) * Math.max(w / hh, hh / w), c = document.createElement('canvas'); c.width = w; c.height = hh;
     const x = c.getContext('2d'); x.translate(w / 2, hh / 2); x.rotate(a); x.scale(sc, sc); x.drawImage(b, -w / 2, -hh / 2);
     const f = (px, py) => { const dx = (px - w / 2) * sc, dy = (py - hh / 2) * sc; return [w / 2 + dx * Math.cos(a) - dy * Math.sin(a), hh / 2 + dx * Math.sin(a) + dy * Math.cos(a)]; };
     S.overlays.forEach(o => { if (o.pts) o.pts = o.pts.map(([u, v]) => f(u, v)); else { [o.x, o.y] = f(o.x, o.y); o.rot += deg; if (o.w) { o.w *= sc; o.h *= sc; } o.sw = (o.sw || 0) * sc; } if (o.size) o.size *= sc; });
-    S.base = c; S.ver++; commit(); renderPanel();
+    owned.add(c); S.base = c; S.ver++; commit(); renderPanel();
   }
   function straightenSec() {
     let ang = 0; const out = h('output', null, '0°'), i = h('input', { type: 'range', class: 'range', min: -45, max: 45, step: 0.5, value: 0, 'aria-label': L('Angle', 'الزاوية') }); i.addEventListener('input', () => { ang = parseFloat(i.value); out.textContent = ang + '°'; });
@@ -407,7 +528,7 @@ export async function mount(root) {
     const btn = h('button', { class: 'btn primary', onclick: async () => {
       btn.disabled = true; btn.textContent = L('Exporting…', 'جارٍ التصدير…');
       try {
-        await new Promise(r => setTimeout(r, 30)); let c = renderFull(); const type = 'image/' + fmt.value;
+        flushJobs(); await new Promise(r => setTimeout(r, 30)); let c = renderFull(); const type = 'image/' + fmt.value;
         if (fmt.value === 'jpeg') { const w = document.createElement('canvas'); w.width = c.width; w.height = c.height; const x = w.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, w.width, w.height); x.drawImage(c, 0, 0); c = w; }
         const blob = await canvasToBlob(c, type, parseFloat(q.value)); let ext = fmt.value === 'jpeg' ? 'jpg' : fmt.value;
         if (blob.type !== type) { ext = blob.type.split('/')[1] || 'png'; toast(L('Your browser does not support ' + fmt.value.toUpperCase() + ' export; saved as ' + ext.toUpperCase() + ' instead.', 'متصفحك لا يدعم تصدير ' + fmt.value.toUpperCase() + '؛ تم الحفظ بصيغة ' + ext.toUpperCase() + '.')); }
@@ -435,5 +556,5 @@ export async function mount(root) {
   build();
   if (S.tab === 'crop') S.tab = 'adjust';
   renderTabs();
-  return () => { disposed = true; ro.disconnect(); cancelAnimationFrame(raf); window.removeEventListener('beforeunload', onBeforeUnload); window.removeEventListener('keydown', onKey); };
+  return () => { disposed = true; flushJobs(); jobHooks.done = null; clearTimeout(settleT); clearTimeout(panelT); ro.disconnect(); cancelAnimationFrame(raf); [work.full, work.low].forEach(w => { if (w.cv) w.cv.width = w.cv.height = 0; }); if (pvSrc) pvSrc.width = pvSrc.height = 0; scr.forEach(c => { c.width = c.height = 0; }); scr.length = 0; window.removeEventListener('beforeunload', onBeforeUnload); window.removeEventListener('keydown', onKey); };
 }

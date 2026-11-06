@@ -4,7 +4,8 @@ const defaults = {
   lang: (navigator.language || 'en').toLowerCase().startsWith('ar') ? 'ar' : 'en',
   theme: 'light',
   autosave: true,
-  autosaveSec: 5
+  autosaveSec: 5,
+  perf: 'auto' // auto | low | mid | high — see js/perf.js
 };
 function load() {
   try { return { ...defaults, ...JSON.parse(localStorage.getItem(KEY) || '{}') }; }

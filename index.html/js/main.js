@@ -1,6 +1,7 @@
 import { settings, setSetting, applyDocument, L, bus, guard, hooks, isAr } from './core.js';
-import { h, icon, refreshIcons, spinner, confirmDialog, $ } from './util.js';
+import { h, icon, refreshIcons, spinner, confirmDialog, loadFonts, $ } from './util.js';
 import { watchRibbon } from './ribbon.js';
+import './perf.js'; // sets <html data-perf="low|mid|high"> before the first page renders
 
 applyDocument();
 matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', applyDocument);
@@ -85,6 +86,7 @@ async function route(opts = {}) {
   view.replaceChildren(spinner());
   if (!def) { view.replaceChildren(notFound()); document.title = '404 — PRINTY'; refreshIcons(); return; }
   document.title = (NAV.find(n => n[0] === name)?.[1] || 'PRINTY') + ' — PRINTY';
+  if (['studio', 'photo', 'templates', 'print'].includes(name)) loadFonts('design');
   try {
     const mod = await def.load();
     if (my !== tok) return;
@@ -120,4 +122,5 @@ bus.addEventListener('settings', (e) => { if (e.detail.key === 'theme') renderHe
 
 renderHeader(); renderFooter();
 route();
+window.addEventListener('load', () => loadFonts('ui'));
 watchRibbon(view);
